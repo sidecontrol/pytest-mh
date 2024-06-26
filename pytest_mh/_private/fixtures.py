@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Generator
+from typing import Any, Callable, Generator
 
-import colorama
 import pytest
 
+from .artifacts import MultihostArtifactsCollectable
 from .data import MultihostItemData
 from .logging import MultihostLogger
-from .multihost import MultihostConfig, MultihostDomain, MultihostHost, MultihostRole
+from .marks import TopologyMark
+from .misc import invoke_callback
+from .multihost import (
+    MultihostConfig,
+    MultihostDomain,
+    MultihostHost,
+    MultihostRole,
+    mh_utility_enter_dependencies,
+    mh_utility_exit_dependencies,
+    mh_utility_pytest_report_teststatus,
+    mh_utility_setup_dependencies,
+    mh_utility_teardown_dependencies,
+)
 from .topology import Topology, TopologyDomain
+from .topology_controller import TopologyController
 
 
 class MultihostFixture(object):
@@ -44,13 +58,17 @@ class MultihostFixture(object):
         :caption: Example of the MultihostFixture object
 
         def test_example(mh: MultihostFixture):
-            mh.test            # -> namespace containing roles as properties
-            mh.test.client     # -> list of hosts providing given role
-            mh.test.client[0]  # -> host object, instance of specific role
+            mh.ns.test            # -> namespace containing roles as properties
+            mh.ns.test.client     # -> list of hosts providing given role
+            mh.ns.test.client[0]  # -> host object, instance of specific role
     """
 
     def __init__(
-        self, request: pytest.FixtureRequest, data: MultihostItemData, multihost: MultihostConfig, topology: Topology
+        self,
+        request: pytest.FixtureRequest,
+        data: MultihostItemData,
+        multihost: MultihostConfig,
+        topology_mark: TopologyMark,
     ) -> None:
         """
         :param request: Pytest request.
@@ -59,8 +77,8 @@ class MultihostFixture(object):
         :type data: MultihostItemData
         :param multihost: Multihost configuration.
         :type multihost: MultihostConfig
-        :param topology: Multihost topology for this request.
-        :type topology: Topology
+        :param topology_mark: Multihost topology mark.
+        :type topology_mark: TopologyMark
         """
 
         self.data: MultihostItemData = data
@@ -78,16 +96,56 @@ class MultihostFixture(object):
         Multihost configuration.
         """
 
+        self.topology_mark: TopologyMark = topology_mark
+        """
+        Topology mark.
+        """
+
+        self.topology: Topology = topology_mark.topology
+        """
+        Topology data.
+        """
+
+        self.topology_controller: TopologyController = topology_mark.controller
+        """
+        Topology controller.
+        """
+
         self.logger: MultihostLogger = multihost.logger
         """
         Multihost logger.
         """
 
+        self.roles: list[MultihostRole] = []
+        """
+        Available MultihostRole objects.
+        """
+
+        self.hosts: list[MultihostHost] = []
+        """
+        Available MultihostHost objects.
+        """
+
+        self.fixtures: dict[str, MultihostRole | list[MultihostRole]] = {}
+        """
+        All dynamic fixtures defined in the topology mapped from name to :class:`MultihostRole`.
+        """
+
+        self.ns: SimpleNamespace = SimpleNamespace()
+        """
+        Roles as object accessible through topology path, e.g. ``mh.ns.domain_id.role_name``.
+        """
+
         self._paths: dict[str, list[MultihostRole] | MultihostRole] = {}
+        self._skipped: bool = False
 
         for domain in self.multihost.domains:
-            if domain.id in topology:
-                setattr(self, domain.id, self._domain_to_namespace(domain, topology.get(domain.id)))
+            if domain.id in self.topology:
+                setattr(self.ns, domain.id, self._domain_to_namespace(domain, self.topology.get(domain.id)))
+
+        self.roles = sorted([x for x in self._paths.values() if isinstance(x, MultihostRole)], key=lambda x: x.role)
+        self.hosts = sorted(list({x.host for x in self.roles}), key=lambda x: x.hostname)
+        self.fixtures = self.topology_mark.map_fixtures_to_roles(self)
 
     def _domain_to_namespace(self, domain: MultihostDomain, topology_domain: TopologyDomain) -> SimpleNamespace:
         ns = SimpleNamespace()
@@ -123,88 +181,262 @@ class MultihostFixture(object):
 
         return self._paths[path]
 
-    @property
-    def _hosts_and_roles(self) -> list[MultihostHost | MultihostRole]:
-        """
-        :return: List containing all hosts and roles available for current test case.
-        :rtype: list[MultihostHost | MultihostRole]
-        """
-        roles: list[MultihostRole] = [x for x in self._paths.values() if isinstance(x, MultihostRole)]
-        hosts: list[MultihostHost] = [x.host for x in roles]
+    def _skip(self) -> bool:
+        self._skipped = False
 
-        return list(set([*hosts, *roles]))
+        reason = self._skip_by_topology(self.topology_controller)
+        if reason is not None:
+            self._skipped = True
+            pytest.skip(reason)
 
-    def _setup(self) -> None:
+        reason = self._skip_by_require_marker(self.topology_mark, self.request.node)
+        if reason is not None:
+            self._skipped = True
+            pytest.skip(reason)
+
+        return self._skipped
+
+    def _skip_by_topology(self, controller: TopologyController):
+        return controller._invoke_with_args(controller.skip)
+
+    def _skip_by_require_marker(self, topology_mark: TopologyMark, node: pytest.Function) -> str | None:
+        fixtures: dict[str, Any] = {k: None for k in topology_mark.fixtures.keys()}
+        fixtures.update(node.funcargs)
+        topology_mark.apply(self, fixtures)
+
+        # Make sure mh fixture is always available
+        fixtures["mh"] = self
+
+        for mark in node.iter_markers("require"):
+            if len(mark.args) not in [1, 2]:
+                raise ValueError(f"{node.nodeid}::{node.originalname}: " "invalid arguments for @pytest.mark.require")
+
+            condition = mark.args[0]
+            reason = "Required condition was not met" if len(mark.args) != 2 else mark.args[1]
+
+            callresult = invoke_callback(condition, **fixtures)
+            if isinstance(callresult, tuple):
+                if len(callresult) != 2:
+                    raise ValueError(
+                        f"{node.nodeid}::{node.originalname}: " "invalid arguments for @pytest.mark.require"
+                    )
+
+                result = callresult[0]
+                reason = callresult[1]
+            else:
+                result = callresult
+
+            if not result:
+                return reason
+
+        return None
+
+    def _setup_hosts_utils(self) -> None:
         """
-        Setup multihost. A setup method is called on each host and role
-        to initialize the test environment to expected state.
+        Enter reentrant utilities in each host.
         """
-        mh_log_phase(self.logger, self.request, "SETUP")
-        try:
-            setup_ok: list[MultihostHost | MultihostRole] = []
-            for item in self._hosts_and_roles:
+        for item in self.hosts:
+            mh_utility_enter_dependencies(item, "test")
+
+    def _setup_hosts(self) -> None:
+        """
+        Run per-test setup of each host.
+        """
+        for item in self.hosts:
+            item._op_state.clear("setup")
+
+        for item in self.hosts:
+            item.setup()
+            item._op_state.set_success("setup")
+
+    def _setup_topology(self) -> None:
+        """
+        Run per-test setup of topology controller.
+        """
+        self.topology_controller._invoke_with_args(self.topology_controller.setup)
+        self.topology_controller._op_state.set_success("setup")
+
+    def _setup_utils(self) -> None:
+        """
+        Run utility setup for each role.
+        """
+        for item in self.roles:
+            mh_utility_setup_dependencies(item)
+
+    def _setup_roles(self) -> None:
+        """
+        Run per-test setup of each role.
+        """
+        for item in self.roles:
+            item.setup()
+            item._op_state.set_success("setup")
+
+    def _teardown_roles(self) -> None:
+        """
+        Run per-test teardown of each role.
+        """
+        errors = []
+        for item in self.roles:
+            if item._op_state.check_success("setup"):
                 try:
-                    item.setup()
-                except Exception:
-                    # Teardown hosts and roles that were successfully setup before this error
-                    for i in reversed(setup_ok):
-                        i.teardown()
-                    raise
-
-                setup_ok.append(item)
-        finally:
-            mh_log_phase(self.logger, self.request, "SETUP DONE")
-
-    def _teardown(self) -> None:
-        """
-        Teardown multihost. The purpose of this method is to revert any changes
-        that were made during a test run. It is automatically called when the
-        test is finished.
-        """
-        mh_log_phase(self.logger, self.request, "TEARDOWN")
-        try:
-            errors = []
-            for item in reversed(self._hosts_and_roles):
-                try:
-                    # Try to collect artifacts from host before the role is teared down.
-                    # We need to do it before the role object is teardown as it may
-                    # potentially remove some of the requested artifacts.
-                    if isinstance(item, MultihostRole):
-                        self._collect_artifacts(item.host)
-
                     item.teardown()
                 except Exception as e:
                     errors.append(e)
 
-            if errors:
-                raise Exception(errors)
+        if errors:
+            raise Exception(errors)
+
+    def _teardown_utils(self) -> None:
+        """
+        Run utility teardown for each role.
+        """
+        for item in self.roles:
+            mh_utility_teardown_dependencies(item)
+
+    def _teardown_topology(self) -> None:
+        """
+        Run per-test teardown from topology controller.
+        """
+        if self.topology_controller._op_state.check_success("setup"):
+            self.topology_controller._invoke_with_args(self.topology_controller.teardown)
+
+    def _teardown_hosts(self) -> None:
+        """
+        Run per-test teardown of each host.
+        """
+        errors = []
+        for item in self.hosts:
+            if item._op_state.check_success("setup"):
+                try:
+                    item.teardown()
+                except Exception as e:
+                    errors.append(e)
+
+        if errors:
+            raise Exception(errors)
+
+    def _teardown_hosts_utils(self) -> None:
+        """
+        Exit reentrant utilities in each host.
+        """
+        errors = []
+        for item in self.hosts:
+            try:
+                mh_utility_exit_dependencies(item, "test")
+            except Exception as e:
+                errors.append(e)
+
+        if errors:
+            raise Exception(errors)
+
+    def _pytest_report_teststatus(
+        self, report: pytest.CollectReport | pytest.TestReport, config: pytest.Config
+    ) -> tuple[str, str, str | tuple[str, dict[str, bool]]] | None:
+        """
+        Run pytest_report_teststatus on each utility.
+        """
+        for item in self.roles + self.hosts:
+            result = mh_utility_pytest_report_teststatus(item, report, config)
+            if result is not None:
+                return result
+
+        return None
+
+    def _collect_artifacts(self) -> None:
+        # Create list of collectable objects
+        collectable: dict[MultihostHost, list[MultihostArtifactsCollectable]] = {}
+        for role in self.roles:
+            host_collection = collectable.setdefault(role.host, [role.host, self.topology_controller, role])
+            host_collection.extend(role._mh_utility_dependencies)
+
+        # Collect artifacts, if an error is raised, we will ignore it since
+        # teardown is more important
+        for host in self.hosts:
+            try:
+                host.artifacts_collector.collect(
+                    "test",
+                    path=f"tests/{self.request.node.name}/{host.role}/{host.hostname}",
+                    outcome=self.data.outcome,
+                    collect_objects=collectable[host],
+                )
+            except Exception as e:
+                self.logger.error(
+                    "An error happend when collecting artifacts",
+                    extra={
+                        "data": {
+                            "Error message": str(e),
+                        }
+                    },
+                )
+
+    def split_log_file(self, name: str) -> None:
+        """
+        Split current log records into a log file.
+
+        :param name: Log file name.
+        :type name: str
+        """
+        self.logger.split(Path(f"tests/{self.request.node.name}") / name)
+
+    def _invoke_phase(self, name: str, cb: Callable, catch: bool = False) -> Exception | None:
+        self.log_phase(name)
+        try:
+            cb()
+        except Exception as e:
+            if catch:
+                return e
+
+            raise
         finally:
-            mh_log_phase(self.logger, self.request, "TEARDOWN DONE")
+            self.log_phase(f"{name} DONE")
 
-    def _collect_artifacts(self, host: MultihostHost) -> None:
+        return None
+
+    def log_phase(self, phase: str) -> None:
         """
-        Collect test artifacts that were requested by the multihost configuration.
+        Log current test phase.
 
-        :param host: Host object where the artifacts will be collected.
-        :type host: MultihostHost
+        :param phase: Phase name or description.
+        :type phase: str
         """
-        dir = self.request.config.getoption("mh_artifacts_dir")
-        mode = self.request.config.getoption("mh_collect_artifacts")
-        if mode == "never" or (mode == "on-failure" and self.data.outcome != "failed"):
-            return
+        self.logger.phase(f"{phase} :: {self.request.node.nodeid}")
 
-        name = self.request.node.name
-        for c in list('":<>|*?'):
-            name = name.replace(c, "-")
+    def _enter(self) -> MultihostFixture:
+        if self._skip():
+            return self
 
-        host.collect_artifacts(f"{dir}/{name}")
+        try:
+            self._invoke_phase("SETUP ENTER HOSTS UTILS", self._setup_hosts_utils)
+            self._invoke_phase("SETUP HOSTS", self._setup_hosts)
+            self._invoke_phase("SETUP TOPOLOGY", self._setup_topology)
+            self._invoke_phase("SETUP UTILS", self._setup_utils)
+            self._invoke_phase("SETUP ROLES", self._setup_roles)
+        except Exception:
+            self.data.outcome = "error"
+            raise
+        finally:
+            self.split_log_file("setup.log")
 
-    def __enter__(self) -> MultihostFixture:
-        self._setup()
         return self
 
-    def __exit__(self, exception_type, exception_value, traceback) -> None:
-        self._teardown()
+    def _exit(self) -> None:
+        if self._skipped:
+            return
+
+        errors: list[Exception | None] = []
+        errors.append(self._invoke_phase("COLLECT ARTIFACTS", self._collect_artifacts, catch=True))
+        errors.append(self._invoke_phase("TEARDOWN ROLES", self._teardown_roles, catch=True))
+        errors.append(self._invoke_phase("TEARDOWN UTILS", self._teardown_utils, catch=True))
+        errors.append(self._invoke_phase("TEARDOWN TOPOLOGY", self._teardown_topology, catch=True))
+        errors.append(self._invoke_phase("TEARDOWN HOSTS", self._teardown_hosts, catch=True))
+        errors.append(self._invoke_phase("TEARDOWN EXIT HOSTS UTILS", self._teardown_hosts_utils, catch=True))
+
+        self.split_log_file("teardown.log")
+        self.logger.flush(self.data.outcome)
+
+        errors = [x for x in errors if x is not None]
+        if errors:
+            raise Exception(errors)
 
 
 @pytest.fixture(scope="function")
@@ -238,19 +470,24 @@ def mh(request: pytest.FixtureRequest) -> Generator[MultihostFixture, None, None
     if data.topology_mark is None:
         raise ValueError("data.topology_mark must not be None")
 
-    mh_log_phase(data.multihost.logger, request, "BEGIN")
+    mh = MultihostFixture(request, data, data.multihost, data.topology_mark)
     try:
-        with MultihostFixture(request, data, data.multihost, data.topology_mark.topology) as mh:
-            mh_log_phase(data.multihost.logger, request, "TEST")
-            yield mh
-            mh_log_phase(data.multihost.logger, request, "TEST DONE")
+        mh._enter()
+        mh.log_phase("TEST")
+
+        data.multihost._in_test = True
+        if data.multihost._sigint:
+            pytest.skip("SIGINT received, aborting running test.")
+
+        yield mh
+
+        mh.log_phase("TEST DONE")
     finally:
-        mh_log_phase(data.multihost.logger, request, "END")
+        data.multihost._in_test = False
+        if data.outcome == "failed" and data.result is not None:
+            mh.logger.error(data.result.longreprtext)
 
+        if not mh._skipped:
+            mh.split_log_file("test.log")
 
-def mh_log_phase(logger: MultihostLogger, request: pytest.FixtureRequest, phase: str) -> None:
-    logger.info(
-        logger.colorize(
-            f"{phase} :: {request.node.nodeid}", colorama.Style.BRIGHT, colorama.Back.BLACK, colorama.Fore.WHITE
-        )
-    )
+        mh._exit()

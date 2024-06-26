@@ -5,9 +5,12 @@ from typing import TYPE_CHECKING, Any, Mapping, Tuple
 
 import pytest
 
+from .topology import Topology
+from .topology_controller import TopologyController
+
 if TYPE_CHECKING:
     from .fixtures import MultihostFixture
-    from .topology import Topology
+    from .multihost import MultihostRole
 
 
 class TopologyMark(object):
@@ -16,12 +19,17 @@ class TopologyMark(object):
 
     * **name**, that is used to identify topology in pytest output
     * **topology** (:class:Topology) that is required to run the test
-    * **fixtures** that are available during the test run
+    * **controller** (:class:TopologyController) to provide per-topology hooks, optional
+    * **fixtures** that are available during the test run, optional
 
     .. code-block:: python
         :caption: Example usage
 
-        @pytest.mark.topology(name, topology, fixture1='path1', fixture2='path2', ...)
+        @pytest.mark.topology(
+            name, topology,
+            controller=controller,
+            fixture=dict(fixture1='path1', fixture2='path2', ...)
+        )
         def test_fixture_name(fixture1: BaseRole, fixture2: BaseRole, ...):
             assert True
 
@@ -40,6 +48,8 @@ class TopologyMark(object):
         self,
         name: str,
         topology: Topology,
+        *,
+        controller: TopologyController | None = None,
         fixtures: dict[str, str] | None = None,
     ) -> None:
         """
@@ -47,6 +57,8 @@ class TopologyMark(object):
         :type name: str
         :param topology: Topology required to run the test.
         :type topology: Topology
+        :param controller: Topology controller, defaults to None
+        :type controller: TopologyController | None, optional
         :param fixtures: Dynamically created fixtures available during the test run, defaults to None
         :type fixtures: dict[str, str] | None, optional
         """
@@ -55,6 +67,9 @@ class TopologyMark(object):
 
         self.topology: Topology = topology
         """Multihost topology."""
+
+        self.controller: TopologyController = controller if controller is not None else TopologyController()
+        """Multihost topology controller."""
 
         self.fixtures: dict[str, str] = fixtures if fixtures is not None else {}
         """Dynamic fixtures mapping."""
@@ -76,8 +91,8 @@ class TopologyMark(object):
         """
         Create required fixtures by modifying pytest.Item.funcargs.
 
-        :param mh: _description_
-        :type mh: Multihost
+        :param mh: Multihost fixture.
+        :type mh: MultihostFixture
         :param funcargs: Pytest test item ``funcargs`` that will be modified.
         :type funcargs: dict[str, Any]
         """
@@ -87,6 +102,23 @@ class TopologyMark(object):
             for name in names:
                 if name in funcargs:
                     funcargs[name] = value
+
+    def map_fixtures_to_roles(self, mh: MultihostFixture) -> dict[str, MultihostRole | list[MultihostRole]]:
+        """
+        Return all topology fixtures mapped to role object(s).
+
+        :param mh: Multihost fixture.
+        :type mh: MultihostFixture
+        :return: Dynamic fixtures mapped to roles.
+        :rtype: dict[str, MultihostRole | list[MultihostRole]]
+        """
+        funcargs: dict[str, MultihostRole | list[MultihostRole] | None] = {name: None for name in self.fixtures.keys()}
+        self.apply(mh, funcargs)
+
+        # To satisfy mypy
+        out: dict[str, MultihostRole | list[MultihostRole]] = {x: y for x, y in funcargs.items() if y is not None}
+
+        return out
 
     def export(self) -> dict:
         """
@@ -137,9 +169,10 @@ class TopologyMark(object):
         :raises ValueError:
         :rtype: TopologyMark
         """
+        nodeid = item.parent.nodeid if item.parent is not None else ""
+        error = f"{nodeid}::{item.originalname}: invalid arguments for @pytest.mark.topology"
+
         if not mark.args or len(mark.args) > 3:
-            nodeid = item.parent.nodeid if item.parent is not None else ""
-            error = f"{nodeid}::{item.originalname}: invalid arguments for @pytest.mark.topology"
             raise ValueError(error)
 
         # Constructor for KnownTopologyBase
@@ -176,7 +209,7 @@ class TopologyMark(object):
         :return: Instance of TopologyMark.
         :rtype: TopologyMark
         """
-        # First three parameters are positional, the rest are keyword arguments.
+        # First two parameters are positional, the rest are keyword arguments.
         if len(args) != 2:
             nodeid = item.parent.nodeid if item.parent is not None else ""
             error = f"{nodeid}::{item.originalname}: invalid arguments for @pytest.mark.topology"
@@ -184,9 +217,10 @@ class TopologyMark(object):
 
         name = args[0]
         topology = args[1]
-        fixtures = {k: str(v) for k, v in kwargs.items()}
+        controller = kwargs.get("controller", None)
+        fixtures = {k: str(v) for k, v in kwargs.get("fixtures", {}).items()}
 
-        return cls(name, topology, fixtures)
+        return cls(name, topology, controller=controller, fixtures=fixtures)
 
 
 class KnownTopologyBase(Enum):

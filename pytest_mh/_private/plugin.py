@@ -4,17 +4,34 @@ import inspect
 import logging
 import sys
 import textwrap
-from typing import Generator, Type
+from functools import partial, wraps
+from os import _exit
+from pathlib import Path
+from signal import SIGINT, signal
+from typing import Generator, Literal, Type, get_type_hints
 
 import pytest
 import yaml
 
+from .artifacts import MultihostArtifactsCollectable, MultihostArtifactsType
 from .data import MultihostItemData
 from .fixtures import MultihostFixture
 from .logging import MultihostLogger
 from .marks import TopologyMark
-from .multihost import MultihostConfig, MultihostHost
+from .multihost import (
+    MultihostArtifactsMode,
+    MultihostConfig,
+    MultihostHost,
+    MultihostReentrantUtility,
+    MultihostRole,
+    mh_utility_enter_dependencies,
+    mh_utility_exit_dependencies,
+    mh_utility_setup_dependencies,
+    mh_utility_teardown_dependencies,
+)
 from .topology import Topology
+from .topology_controller import TopologyController
+from .types import MultihostOutcome
 
 MarkStashKey = pytest.StashKey[TopologyMark | None]()
 
@@ -30,15 +47,28 @@ class MultihostPlugin(object):
         self.multihost: MultihostConfig | None = None
         self.topology: Topology | None = None
         self.confdict: dict | None = None
+        self.current_mh: MultihostFixture | None = None
+        self.current_topology: str | None = None
+        self.required_hosts: list[MultihostHost] = []
 
         # CLI options
         self.mh_config: str = pytest_config.getoption("mh_config")
         self.mh_log_path: str = pytest_config.getoption("mh_log_path")
         self.mh_lazy_ssh: bool = pytest_config.getoption("mh_lazy_ssh")
-        self.mh_topology: str = pytest_config.getoption("mh_topology")
+        self.mh_topology: list[str] = pytest_config.getoption("mh_topology")
+        self.mh_not_topology: list[str] = pytest_config.getoption("mh_not_topology")
         self.mh_exact_topology: bool = pytest_config.getoption("mh_exact_topology")
-        self.mh_collect_artifacts: bool = pytest_config.getoption("mh_collect_artifacts")
-        self.mh_artifacts_dir: bool = pytest_config.getoption("mh_artifacts_dir")
+        self.mh_collect_artifacts: MultihostArtifactsMode = pytest_config.getoption("mh_collect_artifacts")
+        self.mh_artifacts_dir: Path = Path(pytest_config.getoption("mh_artifacts_dir"))
+        self.mh_compress_artifacts: bool = pytest_config.getoption("mh_compress_artifacts")
+
+        # Read --mh-collect-logs, default to --mh-collect-artifacts
+        self.mh_collect_logs: MultihostArtifactsMode = pytest_config.getoption("mh_collect_logs")
+        if self.mh_collect_logs is None:
+            self.mh_collect_logs = self.mh_collect_artifacts
+
+        # pytest options
+        self.pytest_opt_collect_only: bool = pytest_config.getoption("collectonly")
 
     @classmethod
     def GetLogger(cls) -> logging.Logger:
@@ -70,6 +100,37 @@ class MultihostPlugin(object):
         except Exception as e:
             raise IOError(f'Unable to open multihost configuration "{path}": {str(e)}')
 
+    def sigint_handler(self, sig, frame) -> None:
+        # This should not happen
+        if self.multihost is None:
+            self.logger.error("multihost can not be None, terminating")
+            exit(1)
+
+        # User really wants to exit now, ignore teardown
+        if self.multihost._sigint:
+            self.logger.info(
+                "SIGINT received, terminating immediately. "
+                "Teardown was not run, therefore hosts are in undefined state."
+            )
+            _exit(1)
+
+        self.multihost._sigint = True
+
+        # If we are in test, we can terminate gracefully immediately. Teardowns will run.
+        if self.multihost._in_test:
+            pytest.skip("SIGINT received, aborting running test.")
+
+        # Otherwise we have to wait for setup/teardown to finish
+        self.logger.info("")
+        self.logger.info("")
+        self.logger.info("SIGINT received SIGINT, I will finish current test and exit gracefully.")
+        self.logger.info(
+            "If you want to exit immediately, press CTRL-C one more time. "
+            "In this case, however, hosts will end up in an undefined state "
+            "since teardown methods will not run completely."
+        )
+        self.logger.info("")
+
     def setup(self) -> None:
         """
         Read and apply multihost configuration.
@@ -81,10 +142,22 @@ class MultihostPlugin(object):
 
         self.confdict = self.__load_conf(self.mh_config)
 
-        self.multihost = self.config_class(
-            self.confdict, logger=MultihostLogger.Setup(self.mh_log_path), lazy_ssh=self.mh_lazy_ssh
+        logger = MultihostLogger.GetLogger()
+        logger.setup(
+            log_path=self.mh_log_path,
+            artifacts_mode=self.mh_collect_logs,
+            artifacts_dir=self.mh_artifacts_dir,
+            confdict=self.confdict,
         )
 
+        self.multihost = self.config_class(
+            self.confdict,
+            logger=logger,
+            lazy_ssh=self.mh_lazy_ssh,
+            artifacts_dir=self.mh_artifacts_dir,
+            artifacts_mode=self.mh_collect_artifacts,
+            artifacts_compression=self.mh_compress_artifacts,
+        )
         self.topology = Topology.FromMultihostConfig(self.confdict)
 
     @pytest.hookimpl(trylast=True)
@@ -118,24 +191,14 @@ class MultihostPlugin(object):
         self.logger.info(f"  config file: {self.mh_config}")
         self.logger.info(f"  log path: {self.mh_log_path}")
         self.logger.info(f"  lazy ssh: {self.mh_lazy_ssh}")
-        self.logger.info(f"  topology filter: {self.mh_topology}")
+        self.logger.info(f"  topology filter: {', '.join(self.mh_topology + [f'!{x}' for x in self.mh_not_topology])}")
         self.logger.info(f"  require exact topology: {self.mh_exact_topology}")
         self.logger.info(f"  collect artifacts: {self.mh_collect_artifacts}")
         self.logger.info(f"  artifacts directory: {self.mh_artifacts_dir}")
+        self.logger.info(f"  collect logs: {self.mh_collect_logs}")
         self.logger.info("")
 
-        setup_ok: list[MultihostHost] = []
-        for domain in self.multihost.domains:
-            for host in domain.hosts:
-                try:
-                    host.pytest_setup()
-                except Exception:
-                    # Teardown hosts that were successfully setup before this error
-                    for h in reversed(setup_ok):
-                        h.pytest_teardown()
-                    raise
-
-                setup_ok.append(host)
+        signal(SIGINT, self.sigint_handler)
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int | pytest.ExitCode) -> None:
@@ -147,16 +210,9 @@ class MultihostPlugin(object):
         if self.multihost is None:
             return
 
-        errors = []
-        for domain in self.multihost.domains:
-            for host in domain.hosts:
-                try:
-                    host.pytest_teardown()
-                except Exception as e:
-                    errors.append(e)
-
-        if errors:
-            raise Exception(errors)
+        # Run pytest_teardown on all hosts required by selected tests
+        if not self.pytest_opt_collect_only:
+            self._teardown_hosts(self.required_hosts)
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_make_collect_report(self, collector: pytest.Collector) -> Generator[None, pytest.CollectReport, None]:
@@ -200,8 +256,8 @@ class MultihostPlugin(object):
 
         report.result = new_result
 
-    @pytest.hookimpl(tryfirst=True)
-    def pytest_collection_modifyitems(self, config: pytest.Config, items: list[pytest.Item]) -> None:
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_collection_modifyitems(self, config: pytest.Config, items: list[pytest.Item]) -> Generator:
         """
         Filter collected items and deselect these that can not be run on the
         selected multihost configuration.
@@ -211,9 +267,14 @@ class MultihostPlugin(object):
 
         :meta private:
         """
+        data: MultihostItemData | None = None
+        selected: list[pytest.Item] = []
+        deselected: list[pytest.Item] = []
+        mapping: dict[str, list[pytest.Item]] = {}
 
-        selected = []
-        deselected = []
+        # Silent mypy false positive
+        if self.multihost is None:
+            return
 
         for item in items:
             data = MultihostItemData(self.multihost, item.stash[MarkStashKey]) if self.multihost else None
@@ -223,10 +284,53 @@ class MultihostPlugin(object):
                 deselected.append(item)
                 continue
 
-            selected.append(item)
+            # This test can be run, perform delayed initialization of data.
+            if data is not None:
+                data._init()
 
+            # Map test items by topology name so we can sort them later
+            if data is None or data.topology_mark is None:
+                mapping.setdefault("", []).append(item)
+            else:
+                mapping.setdefault(data.topology_mark.name, []).append(item)
+
+        # Sort test by topology name
+        selected = sum([y for _, y in sorted(mapping.items())], [])
+
+        # Yield result to pytest
         config.hook.pytest_deselected(items=deselected)
         items[:] = selected
+
+        yield
+
+        # List of items may have been further modified by other plugins or filters
+        # Remember all hosts required to run selected tests
+        required_hosts_set: set[MultihostHost] = set()
+        for item in items:
+            data = MultihostItemData.GetData(item)
+            if data is None or data.topology_mark is None:
+                continue
+
+            required_hosts_set.update(self.multihost.topology_hosts(data.topology_mark.topology))
+
+        # Sort required host by name to provide deterministic runs
+        self.required_hosts = sorted(required_hosts_set, key=lambda x: x.hostname)
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_collection_finish(self, session: pytest.Session) -> Generator:
+        # Log required hosts
+        self.logger.info("")
+        self.logger.info("")
+        self.logger.info(self._fmt_bold("Selected tests will use the following hosts:"))
+        for host in self.required_hosts:
+            self.logger.info(f"  {host.role}: {host.hostname}")
+        self.logger.info("")
+
+        yield
+
+        # Run pytest_setup on all hosts required by selected tests
+        if not self.pytest_opt_collect_only:
+            self._setup_hosts(self.required_hosts)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> None:
@@ -244,20 +348,31 @@ class MultihostPlugin(object):
             return
 
         data: MultihostItemData | None = MultihostItemData.GetData(item)
-        if data is None:
+        if self.multihost is None or data is None or data.topology_mark is None:
             return
+        mark: TopologyMark = data.topology_mark
+
+        if self.multihost._sigint:
+            pytest.exit("Aborted because SIGINT was received.")
+
+        # Execute per-topology setup if topology is switched.
+        if self._topology_switch(None, item):
+            self.current_topology = mark.name
+            self._setup_topology(mark.name, mark.controller)
+
+        if not mark.controller._op_state.check_success("topology_setup"):
+            pytest.skip("Error in topology setup")
+
+        # Make mh fixture always available
+        if "mh" not in item.fixturenames:
+            item.fixturenames.append("mh")
 
         # Fill in parameters that will be set later in pytest_runtest_call hook,
         # otherwise pytest will raise unknown fixture error.
-        if data.topology_mark is not None:
-            # Make mh fixture always available
-            if "mh" not in item.fixturenames:
-                item.fixturenames.append("mh")
-
-            spec = inspect.getfullargspec(item.obj)
-            for arg in data.topology_mark.args:
-                if arg in spec.args:
-                    item.funcargs[arg] = None
+        spec = inspect.getfullargspec(item.obj)
+        for arg in mark.args:
+            if arg in spec.args:
+                item.funcargs[arg] = None
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_call(self, item: pytest.Item) -> None:
@@ -278,7 +393,52 @@ class MultihostPlugin(object):
             if not isinstance(mh, MultihostFixture):
                 raise ValueError(f"Fixture mh is not MultihostFixture but {type(mh)}!")
 
+            self.current_mh = mh
             data.topology_mark.apply(mh, item.funcargs)
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_teardown(self, item: pytest.Item, nextitem: pytest.Item | None) -> Generator:
+        """
+        Teardown topology if we detect a topology switch.
+
+        :meta private:
+        """
+        # Inner teardown callback may raise error, but we still need to call
+        # topology teardown if needed.
+        try:
+            yield
+        finally:
+            self.current_mh = None
+
+            if self.multihost is None:
+                return
+
+            data: MultihostItemData | None = MultihostItemData.GetData(item)
+            if data is None or data.topology_mark is None:
+                return
+            mark: TopologyMark = data.topology_mark
+
+            # Execute per-topology teardown if topology changed.
+            if self._topology_switch(item, nextitem) or self.multihost._sigint:
+                self._teardown_topology(mark.name, mark.controller)
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_report_teststatus(
+        self, report: pytest.CollectReport | pytest.TestReport, config: pytest.Config
+    ) -> tuple[str, str, str | tuple[str, dict[str, bool]]] | None:
+        if report.when != "call":
+            return None
+
+        if hasattr(report, "_pytest_mh__teststatus"):
+            return report._pytest_mh__teststatus
+
+        if self.current_mh is None:
+            return None
+
+        status = self.current_mh._pytest_report_teststatus(report, config)
+        setattr(report, "_pytest_mh__teststatus", status)
+
+        return status
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(
@@ -300,6 +460,7 @@ class MultihostPlugin(object):
             return
 
         data.outcome = result.outcome
+        data.result = result
 
     # Hook from pytest-output plugin
     @pytest.hookimpl(optionalhook=True)
@@ -357,11 +518,15 @@ class MultihostPlugin(object):
                 if not self.topology.satisfies(data.topology_mark.topology):
                     return False
 
-        if self.mh_topology is not None:
+        if self.mh_not_topology:
+            if data.topology_mark is not None and data.topology_mark.name in self.mh_not_topology:
+                return False
+
+        if self.mh_topology:
             if data.topology_mark is None:
                 return False
 
-            if self.mh_topology != data.topology_mark.name:
+            if data.topology_mark.name not in self.mh_topology:
                 return False
 
         return True
@@ -379,6 +544,218 @@ class MultihostPlugin(object):
             originalname=f.originalname,
         )
 
+    def _topology_switch(self, curitem: pytest.Item | None, nextitem: pytest.Item | None) -> bool:
+        # No more items means topology switch for our usecase
+        if nextitem is None:
+            return True
+
+        # If current item is None, we need to check current topology
+        if curitem is None:
+            # This is a first test in the new topology
+            if self.current_topology is None:
+                return True
+            # We always set current_topology to None when switching topologies
+            else:
+                return False
+
+        curdata: MultihostItemData | None = MultihostItemData.GetData(curitem)
+        nextdata: MultihostItemData | None = MultihostItemData.GetData(nextitem)
+
+        if curdata is None or nextdata is None:
+            raise RuntimeError("Data can not be None")
+
+        # If the test does not have topology marker, we consider it a switch
+        if curdata.topology_mark is None or nextdata.topology_mark is None:
+            return True
+
+        # Different topology name is a switch
+        if curdata.topology_mark.name != nextdata.topology_mark.name:
+            return True
+
+        return False
+
+    def _setup_hosts(self, hosts: list[MultihostHost]) -> None:
+        # Silent mypy false positive
+        if self.multihost is None:
+            raise RuntimeError("Multihost configuration is not present.")
+
+        for host in hosts:
+            outcome: MultihostOutcome = "error"
+            try:
+                try:
+                    host.logger.phase(f"PYTEST SETUP HOST UTILS :: {host.hostname}")
+                    mh_utility_setup_dependencies(host, [MultihostReentrantUtility])
+                    host._op_state.set_success("pytest_setup_utils")
+                finally:
+                    host.logger.phase(f"PYTEST SETUP HOST UTILS DONE :: {host.hostname}")
+
+                try:
+                    host.logger.phase(f"PYTEST SETUP :: {host.hostname}")
+                    host.pytest_setup()
+                    host._op_state.set_success("pytest_setup")
+                    outcome = "passed"
+                finally:
+                    host.logger.phase(f"PYTEST SETUP DONE :: {host.hostname}")
+            finally:
+                self._collect_artifacts(
+                    id=host.hostname,
+                    hostdir=False,
+                    type="pytest_setup",
+                    path=f"hosts/{host.hostname}/pytest_setup",
+                    collectable={host: [host, *host._mh_utility_dependencies]},
+                    outcome=outcome,
+                    logger=host.logger,
+                )
+
+                self.multihost.logger.flush(outcome, f"hosts/{host.hostname}/pytest_setup.log")
+
+    def _teardown_hosts(self, hosts: list[MultihostHost]) -> None:
+        # Silent mypy false positive
+        if self.multihost is None:
+            raise RuntimeError("Multihost configuration is not present.")
+
+        errors = []
+        for host in hosts:
+            outcome: MultihostOutcome = "error"
+            try:
+                try:
+                    host.logger.phase(f"PYTEST TEARDOWN :: {host.hostname}")
+                    if host._op_state.check_success("pytest_setup"):
+                        host.pytest_teardown()
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    host.logger.phase(f"PYTEST TEARDOWN DONE :: {host.hostname}")
+
+                try:
+                    host.logger.phase(f"PYTEST TEARDOWN HOST UTILS :: {host.hostname}")
+                    mh_utility_teardown_dependencies(host, [MultihostReentrantUtility])
+                    outcome = "passed"
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    host.logger.phase(f"PYTEST TEARDOWN HOST UTILS DONE :: {host.hostname}")
+            finally:
+                self._collect_artifacts(
+                    id=host.hostname,
+                    hostdir=False,
+                    type="pytest_teardown",
+                    path=f"hosts/{host.hostname}/pytest_teardown",
+                    collectable={host: [host, *host._mh_utility_dependencies]},
+                    outcome=outcome,
+                    logger=host.logger,
+                )
+
+                self.multihost.logger.flush(outcome, f"hosts/{host.hostname}/pytest_teardown.log")
+
+        if errors:
+            raise Exception(errors)
+
+    def _setup_topology(self, name: str, controller: TopologyController) -> None:
+        # Silent mypy false positive
+        if self.multihost is None:
+            raise RuntimeError("Multihost configuration is not present.")
+
+        outcome: MultihostOutcome = "error"
+        try:
+            try:
+                controller.logger.phase(f"TOPOLOGY SETUP ENTER HOST UTILS :: {name}")
+                for host in controller.hosts:
+                    mh_utility_enter_dependencies(host, "topology_setup")
+            finally:
+                controller.logger.phase(f"TOPOLOGY SETUP ENTER HOST UTILS DONE :: {name}")
+
+            try:
+                controller.logger.phase(f"TOPOLOGY SETUP :: {name}")
+                controller._invoke_with_args(controller.set_artifacts)
+                controller._invoke_with_args(controller.topology_setup)
+                controller._op_state.set_success("topology_setup")
+                outcome = "passed"
+            finally:
+                controller.logger.phase(f"TOPOLOGY SETUP DONE :: {name}")
+        finally:
+            self._collect_artifacts(
+                id=name,
+                hostdir=True,
+                type="topology_setup",
+                path=f"topologies/{name}/topology_setup",
+                collectable={x: [x, *x._mh_utility_dependencies, controller] for x in controller.hosts},
+                outcome=outcome,
+                logger=controller.logger,
+            )
+
+            self.multihost.logger.flush(outcome, f"topologies/{name}/topology_setup.log")
+
+    def _teardown_topology(self, name: str, controller: TopologyController) -> None:
+        # Silent mypy false positive
+        if self.multihost is None:
+            raise RuntimeError("Multihost configuration is not present.")
+
+        outcome: MultihostOutcome = "error"
+        try:
+            errors = []
+            try:
+                controller.logger.phase(f"TOPOLOGY TEARDOWN :: {name}")
+                if controller._op_state.check_success("topology_setup"):
+                    controller._invoke_with_args(controller.topology_teardown)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                self.current_topology = None
+                controller.logger.phase(f"TOPOLOGY TEARDOWN DONE :: {name}")
+
+            controller.logger.phase(f"TOPOLOGY TEARDOWN EXIT HOST UTILS :: {name}")
+            for host in controller.hosts:
+                try:
+                    mh_utility_exit_dependencies(host, "topology_setup")
+                except Exception as e:
+                    errors.append(e)
+            controller.logger.phase(f"TOPOLOGY TEARDOWN EXIT HOST UTILS DONE :: {name}")
+
+            if errors:
+                raise Exception(errors)
+
+            outcome = "passed"
+        finally:
+            self._collect_artifacts(
+                id=name,
+                hostdir=True,
+                type="topology_teardown",
+                path=f"topologies/{name}/topology_teardown",
+                collectable={x: [x, *x._mh_utility_dependencies, controller] for x in controller.hosts},
+                outcome=outcome,
+                logger=controller.logger,
+            )
+
+            self.multihost.logger.flush(outcome, f"topologies/{name}/topology_teardown.log")
+
+    def _collect_artifacts(
+        self,
+        *,
+        id: str,
+        hostdir: bool,
+        type: MultihostArtifactsType,
+        path: str,
+        collectable: dict[MultihostHost, list[MultihostArtifactsCollectable]],
+        outcome: MultihostOutcome,
+        logger: MultihostLogger,
+    ) -> None:
+        logger.phase(f"COLLECT ARTIFACTS :: {id}")
+        for host, objects in collectable.items():
+            dest = f"{path}/{host.hostname}" if hostdir else path
+            try:
+                host.artifacts_collector.collect(type, path=dest, outcome=outcome, collect_objects=objects)
+            except Exception as e:
+                self.logger.error(
+                    "An error happend when collecting artifacts",
+                    extra={
+                        "data": {
+                            "Error message": str(e),
+                        }
+                    },
+                )
+        logger.phase(f"COLLECT ARTIFACTS DONE :: {id}")
+
 
 # These pytest hooks must be available outside of the plugin's class because
 # they are executed before the plugin is registered.
@@ -395,7 +772,19 @@ def pytest_addoption(parser):
 
     parser.addoption("--mh-lazy-ssh", action="store_true", help="Postpone connecting to host SSH until it is required")
 
-    parser.addoption("--mh-topology", action="store", help="Filter tests by given topology")
+    parser.addoption(
+        "--mh-topology",
+        action="append",
+        default=[],
+        help="Filter tests by given topology, can be set multiple times",
+    )
+
+    parser.addoption(
+        "--mh-not-topology",
+        action="append",
+        default=[],
+        help="Do not run tests for given topology, can be set multiple times",
+    )
 
     parser.addoption(
         "--mh-exact-topology",
@@ -419,6 +808,21 @@ def pytest_addoption(parser):
         help="Directory where artifacts will be stored (default: %(default)s)",
     )
 
+    parser.addoption(
+        "--mh-compress-artifacts",
+        action="store_true",
+        help="If set, test artifacts are stored in a compressed archive",
+    )
+
+    parser.addoption(
+        "--mh-collect-logs",
+        action="store",
+        default=None,
+        nargs="?",
+        choices=["never", "on-failure", "always"],
+        help="Collect logs mode (default: use value of --mh-collect-artifacts)",
+    )
+
 
 def pytest_configure(config: pytest.Config):
     """
@@ -432,4 +836,77 @@ def pytest_configure(config: pytest.Config):
         + "*, fixture1=target1, ...): topology required to run the test",
     )
 
+    config.addinivalue_line(
+        "markers",
+        "require(condition, reason): evaluate condition, parameters may be topology fixture, "
+        "the test is skipped if condition is not met",
+    )
+
     config.pluginmanager.register(MultihostPlugin(config), "MultihostPlugin")
+
+
+def mh_fixture(scope: Literal["function"] = "function"):
+    """
+    This creates a function-scoped pytest fixture that can access MultihostRole
+    objects that are available to the test directly.
+
+    .. note::
+
+        For this to work correctly, all multihost fixtures have to be correctly
+        typed. It will not work without the type hints.
+
+    At this moment, only ``function`` scope is supported.
+
+    .. code-block:: python
+
+        @mh_fixture()
+        def my_fixture(client: Client, request: pytest.FixtureRequest):
+            pass
+
+        @pytest.mark.topology(KnownTopology.LDAP)
+        def test_example(client: Client, ldap: LDAP, my_fixture):
+            pass
+
+    :param scope: Fixture scope, defaults to "function"
+    :type scope: Literal[&quot;function&quot;], optional
+    """
+
+    def decorator(fn):
+        full_sig = inspect.signature(fn)
+        mh_args = []
+        for arg, hint in get_type_hints(fn).items():
+            if issubclass(hint, MultihostRole):
+                mh_args.append(arg)
+                continue
+
+        @wraps(fn)
+        def wrapper(mh: MultihostFixture, *args, **kwargs):
+            if "mh" in full_sig.parameters:
+                kwargs["mh"] = mh
+
+            for arg in mh_args:
+                if arg not in mh.fixtures:
+                    raise KeyError(f"{fn.__name__}: Parameter {arg} is not a valid topology fixture")
+
+                kwargs[arg] = mh.fixtures[arg]
+
+            return fn(*args, **kwargs)
+
+        # Bound multihost parameters
+        cb = wraps(fn)(partial(wrapper, **{arg: None for arg in mh_args}))
+
+        # Create pytest fixture
+        fixture = pytest.fixture(scope="function")(cb)
+
+        # Mock parameters so they are correctly recognized by pytest fixture
+        partial_parameters = [inspect.Parameter("mh", inspect._POSITIONAL_OR_KEYWORD)]
+        partial_parameters.extend(
+            [param for key, param in full_sig.parameters.items() if key != "mh" and key not in mh_args]
+        )
+        fixture.__pytest_wrapped__.obj.func.__signature__ = inspect.Signature(
+            partial_parameters, return_annotation=full_sig.return_annotation
+        )
+
+        return fixture
+
+    return decorator

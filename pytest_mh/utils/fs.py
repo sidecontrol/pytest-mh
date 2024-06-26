@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import base64
 import textwrap
+from collections import deque
+from typing import Self
 
-from .. import MultihostHost, MultihostUtility
+from .. import MultihostHost, MultihostReentrantUtility
 from ..ssh import SSHLog, SSHProcessResult
 
 __all__ = ["LinuxFileSystem"]
 
 
-class LinuxFileSystem(MultihostUtility):
+class LinuxFileSystem(MultihostReentrantUtility):
     """
     Perform file system operations on remote host.
 
@@ -22,20 +24,42 @@ class LinuxFileSystem(MultihostUtility):
         :type host: MultihostHost
         """
         super().__init__(host)
+        self.__states: deque[tuple[list[str], dict[str, tuple[str, str]]]] = deque()
         self.__rollback: list[str] = []
-        self.__backup: dict[str, bool] = {}
+        self.__backup: dict[str, tuple[str, str]] = {}
 
-    def teardown(self):
+    def __enter__(self) -> Self:
         """
-        Revert all file system changes.
+        Saves current state.
 
-        :meta private:
+        :return: Self.
+        :rtype: Self
         """
-        cmd = "\n".join(reversed(self.__rollback))
-        if cmd:
-            self.host.ssh.run(cmd)
+        self.__states.append((self.__rollback, self.__backup))
+        self.__rollback = []
+        self.__backup = {}
 
-        super().teardown()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Revert all changes done during current context.
+        """
+        if self.__rollback:
+            self.host.logger.info(
+                "Reverting file system changes",
+                extra={
+                    "data": {
+                        "Paths": [f"{path} ({state})" for path, (_, state) in sorted(self.__backup.items())],
+                    }
+                },
+            )
+
+            cmd = "\n".join(reversed(self.__rollback))
+            if cmd:
+                self.host.ssh.run(cmd, log_level=SSHLog.Error)
+
+        self.__rollback, self.__backup = self.__states.pop()
 
     def mkdir(self, path: str, *, mode: str | None = None, user: str | None = None, group: str | None = None) -> None:
         """
@@ -51,7 +75,7 @@ class LinuxFileSystem(MultihostUtility):
         :type group: str | None, optional
         """
         self.backup(path)
-        self.logger.info(f'Creating directory "{path}" on {self.host.hostname}')
+        self.logger.info(f'Creating directory "{path}"')
         self.host.ssh.run(
             f"""
                 set -ex
@@ -77,8 +101,9 @@ class LinuxFileSystem(MultihostUtility):
         :param group: Group, defaults to None
         :type group: str | None, optional
         """
+        backup_exists = path in self.__backup
         self.backup(path)
-        self.logger.info(f'Creating directory "{path}" (with parents) on {self.host.hostname}')
+        self.logger.info(f'Creating directory "{path}" (with parents)')
         result = self.host.ssh.run(
             f"""
                 set -ex
@@ -89,8 +114,14 @@ class LinuxFileSystem(MultihostUtility):
             log_level=SSHLog.Error,
         )
 
-        if result.stdout:
-            self.__rollback.append(f"rm --force --recursive '{result.stdout}'")
+        if result.stdout and result.stdout != path:
+            if not backup_exists:
+                action, _ = self.__backup.pop(path)
+                self.__rollback.remove(action)
+
+            action = f"rm --force --recursive '{result.stdout}'"
+            self.__rollback.append(action)
+            self.__backup[result.stdout] = (action, "delete")
 
     def mktmp(
         self,
@@ -119,7 +150,7 @@ class LinuxFileSystem(MultihostUtility):
         :rtype: str
         """
 
-        self.logger.info(f"Creating temporary file on {self.host.hostname}")
+        self.logger.info("Creating temporary file")
         result = self.host.ssh.run(
             """
                 set -ex
@@ -133,15 +164,15 @@ class LinuxFileSystem(MultihostUtility):
         if not tmpfile:
             raise OSError("Temporary file was not created")
 
-        self.__rollback.append(f"rm --force '{tmpfile}'")
+        action = f"rm --force '{tmpfile}'"
+        self.__backup[tmpfile] = (action, "delete")
+        self.__rollback.append(action)
 
         if contents is not None:
             if dedent:
                 contents = textwrap.dedent(contents).strip()
 
-            self.logger.info(
-                f'Writing file "{tmpfile}" on {self.host.hostname}', extra={"data": {"Contents": contents}}
-            )
+            self.logger.info(f'Writing file "{tmpfile}"', extra={"data": {"Contents": contents}})
             self.host.ssh.run(f"cat > '{tmpfile}'", input=contents, log_level=SSHLog.Error)
 
         attrs = self.__gen_chattrs(tmpfile, mode=mode, user=user, group=group)
@@ -149,6 +180,24 @@ class LinuxFileSystem(MultihostUtility):
             self.host.ssh.run(attrs, log_level=SSHLog.Error)
 
         return tmpfile
+
+    def rm(self, path: str) -> None:
+        """
+        Remove remote file or directory.
+
+        :param path: File path.
+        :type path: str
+        """
+        self.backup(path)
+        self.logger.info(f'Removing file "{path}"')
+
+        self.host.ssh.run(
+            f"""
+                set -ex
+                rm -fr '{path}'
+            """,
+            log_level=SSHLog.Error,
+        )
 
     def read(self, path: str) -> str:
         """
@@ -159,10 +208,27 @@ class LinuxFileSystem(MultihostUtility):
         :return: File contents.
         :rtype: str
         """
-        self.logger.info(f'Reading file "{path}" on {self.host.hostname}')
+        self.logger.info(f'Reading file "{path}"')
         result = self.host.ssh.exec(["cat", path], log_level=SSHLog.Error)
 
         return result.stdout
+
+    def exists(self, path: str) -> bool:
+        """
+        Checks file or directory to see if they exist.
+
+        :param path: File path.
+        :type path: str
+        :return: True or False
+        :rtype: bool
+        """
+        self.logger.info(f'Checking if "{path}" exists')
+        result = self.host.ssh.exec(["ls", path], log_level=SSHLog.Error, raise_on_error=False)
+
+        if result.rc == 0:
+            return True
+
+        return False
 
     def write(
         self,
@@ -194,12 +260,16 @@ class LinuxFileSystem(MultihostUtility):
             contents = textwrap.dedent(contents).strip()
 
         self.backup(path)
-        self.logger.info(f'Writing file "{path}" on {self.host.hostname}', extra={"data": {"Contents": contents}})
+        self.logger.info(f'Writing file "{path}"', extra={"data": {"Contents": contents}})
 
         self.host.ssh.run(
             f"""
                 set -ex
-                rm -fr '{path}'
+
+                if [ -d '{path}' ]; then
+                  rm -fr '{path}'
+                fi
+
                 cat > '{path}'
                 {self.__gen_chattrs(path, mode=mode, user=user, group=group)}
             """,
@@ -228,7 +298,7 @@ class LinuxFileSystem(MultihostUtility):
             contents = textwrap.dedent(contents).strip()
 
         self.backup(path)
-        self.logger.info(f'Appending to file "{path}" on {self.host.hostname}', extra={"data": {"Contents": contents}})
+        self.logger.info(f'Appending to file "{path}"', extra={"data": {"Contents": contents}})
 
         self.host.ssh.run(
             f"""
@@ -262,7 +332,7 @@ class LinuxFileSystem(MultihostUtility):
         :type dedent: bool, optional
         """
         self.backup(path)
-        self.logger.info(f'Touching file "{path}" on {self.host.hostname}')
+        self.logger.info(f'Touching file "{path}"')
 
         self.host.ssh.run(
             f"""
@@ -288,12 +358,49 @@ class LinuxFileSystem(MultihostUtility):
         :type size: int, optional
         """
         self.backup(path)
-        self.logger.info(f'Truncating file "{path}" on {self.host.hostname}', extra={"data": {"Size": size}})
+        self.logger.info(f'Truncating file "{path}"', extra={"data": {"Size": size}})
 
         self.host.ssh.run(
             f"""
                 set -ex
                 truncate -s '{size}' '{path}'
+            """,
+            log_level=SSHLog.Error,
+        )
+
+    def copy(
+        self,
+        srcpath: str,
+        dstpath: str,
+        *,
+        mode: str | None = None,
+        user: str | None = None,
+        group: str | None = None,
+    ) -> None:
+        """
+        Copy a remote file @srcpath to remote @dstpath.
+
+        :param srcpath: Remote source file path.
+        :type srcpath: str
+        :param dstpath: Remote destination file path.
+        :type dstpath: str
+        :param mode: Access mode (chmod value), defaults to None
+        :type mode: str | None, optional
+        :param user: Owner, defaults to None
+        :type user: str | None, optional
+        :param group: Group, defaults to None
+        :type group: str | None, optional
+        :param dedent: Automatically dedent and strip file contents, defaults to True
+        :type dedent: bool, optional
+        """
+        self.backup(dstpath)
+        self.logger.info(f'Copying file "{srcpath}" to "{dstpath}"')
+
+        self.host.ssh.run(
+            f"""
+                set -ex
+                cp --archive '{srcpath}' '{dstpath}'
+                {self.__gen_chattrs(dstpath, mode=mode, user=user, group=group)}
             """,
             log_level=SSHLog.Error,
         )
@@ -329,14 +436,17 @@ class LinuxFileSystem(MultihostUtility):
         self.host.ssh.run(
             f"""
                 set -ex
-                rm -fr '{remote_path}'
+
+                if [ -d '{remote_path}' ]; then
+                  rm -fr '{remote_path}'
+                fi
+
                 base64 --decode > '{remote_path}'
                 {self.__gen_chattrs(remote_path, mode=mode, user=user, group=group)}
             """,
             input=encoded,
             log_level=SSHLog.Error,
         )
-        self.__rollback.append(f"rm --force '{remote_path}'")
 
     def upload_to_tmp(
         self,
@@ -379,7 +489,7 @@ class LinuxFileSystem(MultihostUtility):
         :param local_path: Local path.
         :type local_path: str
         """
-        self.logger.info(f'Downloading file "{remote_path}" from {self.host.hostname} to "{local_path}"')
+        self.logger.info(f'Downloading file "{self.host.hostname}:{remote_path}" to "{local_path}"')
         result = self.host.ssh.exec(["base64", remote_path], log_level=SSHLog.Error)
         with open(local_path, "wb") as f:
             f.write(base64.b64decode(result.stdout))
@@ -432,7 +542,7 @@ class LinuxFileSystem(MultihostUtility):
             # Backup is already present
             return True
 
-        self.logger.info(f'Creating a backup of "{path}" on {self.host.hostname}')
+        self.logger.info(f'Creating a backup of "{path}"')
         result = self.host.ssh.run(
             f"""
         set -ex
@@ -440,25 +550,56 @@ class LinuxFileSystem(MultihostUtility):
         if [ -f '{path}' ]; then
             tmp=`mktemp /tmp/mh.fs.rollback.XXXXXXXXX`
             cp --force --archive '{path}' "$tmp"
-            echo "mv --force '$tmp' '{path}'"
+            echo "cp --force --archive '$tmp' '{path}' && rm --force '$tmp'"
+            echo "restore file"
         elif [ -d '{path}' ]; then
             tmp=`mktemp -d /tmp/mh.fs.rollback.XXXXXXXXX`
             cp --force --archive '{path}/.' "$tmp"
             echo "rm --force --recursive '{path}' && mv --force '$tmp' '{path}'"
+            echo "restore directory"
         elif [ ! -d '{path}' ] && [ ! -f '{path}' ]; then
             echo "rm --force --recursive '{path}'"
+            echo "delete"
         fi
         """,
             log_level=SSHLog.Error,
         )
 
-        action = result.stdout.strip()
-        if action:
-            self.__rollback.append(action)
-            self.__backup[path] = True
-            return True
+        action = result.stdout_lines[-2]
+        state = result.stdout_lines[-1]
 
-        return False
+        self.__rollback.append(action)
+        self.__backup[path] = (action, state)
+        return state != "delete"
+
+    def restore(self, path: str) -> bool:
+        """
+        Restore file or directory from previous backup.
+
+        .. note::
+            It is also possible that the file or directory does not exist. In
+            that case, the path is removed to remove any file or directory that
+            might have been created.
+
+        :param path: Path to restore.
+        :type path: str
+        :return: True if the backup of path exists and it was restored, False otherwise.
+        :rtype: bool
+        """
+        item = self.__backup.get(path)
+        if item is None:
+            # Backup is not present
+            return False
+
+        action, state = item
+
+        self.logger.info(f'Restoring "{path}" from backup ({state})')
+        self.host.ssh.run(action, log_level=SSHLog.Error)
+
+        self.__rollback.remove(action)
+        del self.__backup[path]
+
+        return True
 
     def __gen_chattrs(
         self, path: str, *, mode: str | None = None, user: str | None = None, group: str | None = None
@@ -509,4 +650,91 @@ class LinuxFileSystem(MultihostUtility):
         if chars:
             args.append("-m")
 
-        return self.host.ssh.exec(["wc", *args, file])
+        return self.host.ssh.exec(["wc", *args, file], log_level=SSHLog.Error)
+
+    def diff(
+        self,
+        path1: str,
+        path2: str,
+        *,
+        brief: bool = False,
+        recursive: bool = False,
+        ignore_case: bool = False,
+        args: list[str] | None = None,
+    ) -> SSHProcessResult:
+        """
+        Compare files line by line.
+        Exit status is 0 if inputs are the same, 1 if different, 2 if trouble.
+
+        :param path1: Path to file or directory to be compared
+        :type path1: str
+        :param path2: Path to file or directory to be compared
+        :type path2: str
+        :param brief: Report only when files differ, but do not print the diff itself, defaults to False
+        :type brief: bool, optional
+        :param recursive: Recursively compare any subdirectories found, defaults to False
+        :type recursive: bool, optional
+        :param ignore_case: Ignore case differences in file contents, defaults to False
+        :type ignore_case: bool, optional
+        :param args: Additional options, defaults to None
+        :type args: list[str] | None, optional
+        :return: Result of process
+        :rtype: SSHProcessResult
+        """
+        args = args if args else []
+        if brief:
+            args.append("--brief")
+        if recursive:
+            args.append("--recursive")
+        if ignore_case:
+            args.append("--ignore-case")
+
+        return self.host.ssh.exec(["diff", *args, path1, path2], raise_on_error=False)
+
+    def chmod(self, mode: str, path: str, args: list[str] | None = None) -> SSHProcessResult:
+        """
+        Change file/folder mode bits.
+        Mode can be specified in two ways: octal number e.g. "666", "444" or
+        a symbolic representation of changes e.g. "u=rw,go=r", "go-rw"
+
+        :param mode: New mode of file/folder
+        :type mode: str
+        :param path: File or folder whose permissions change
+        :type path: str
+        :param args: Additional options, defaults to None
+        :type args: list[str] | None, optional
+        :return: Result of process
+        :rtype: SSHProcessResult
+        """
+        self.backup(path)
+        self.logger.info(f'Changing mode to "{mode}" for "{path}"')
+        args = args if args else []
+        return self.host.ssh.exec(["chmod", *args, mode, path], log_level=SSHLog.Error)
+
+    def chown(
+        self, path: str, user: str | None = None, group: str | None = None, args: list[str] | None = None
+    ) -> SSHProcessResult:
+        """
+        Change file owner and group.
+
+        :param path: Path to file
+        :type path: str
+        :param user: New file owner, if None then user remains same, defaults to None
+        :type user: str | None, optional
+        :param group: New file group, if None then group remains same, defaults to None
+        :type group: str | None, optional
+        :param args: Additional options, defaults to None
+        :type args: list[str] | None, optional
+        :return: Result of process
+        :rtype: SSHProcessResult
+        """
+        self.backup(path)
+        if user:
+            self.logger.info(f'Changing owner of "{path}" to "{user}"')
+        if group:
+            self.logger.info(f'Changing group of "{path}" to "{group}"')
+
+        args = args if args else []
+        mode = f"{user}" if user else ""
+        mode += f":{group}" if group else ""
+        return self.host.ssh.exec(["chown", mode, *path.split(), *args], log_level=SSHLog.Error)
